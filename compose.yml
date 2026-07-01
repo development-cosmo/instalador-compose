@@ -89,7 +89,6 @@ services:
       - "traefik.http.routers.backend.rule=PathPrefix(`/api/`) || PathPrefix(`/admin/`) || PathPrefix(`/ws/`) || PathPrefix(`/health/`) || Path(`/health`)"
       - "traefik.http.routers.backend.entrypoints=web"
       - "traefik.http.services.backend.loadbalancer.server.port=8000"
-      - "com.centurylinklabs.watchtower.enable=true"
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:8000/health/ || exit 1"]
       interval: 10s
@@ -108,8 +107,6 @@ services:
     depends_on:
       django_migration_runner: { condition: service_completed_successfully }
     command: celery -A ERP worker --loglevel=info --autoscale=${CELERY_MAX_WORKERS:-8},${CELERY_MIN_WORKERS:-2}
-    labels:
-      - "com.centurylinklabs.watchtower.enable=true"
     <<: *logging-config
 
   celery_beat:
@@ -122,8 +119,6 @@ services:
     depends_on:
       django_migration_runner: { condition: service_completed_successfully }
     command: celery -A ERP beat --loglevel=info --scheduler django_celery_beat.schedulers:DatabaseScheduler
-    labels:
-      - "com.centurylinklabs.watchtower.enable=true"
     <<: *logging-config
 
   frontend_local:
@@ -137,7 +132,6 @@ services:
       - "traefik.http.routers.frontend.entrypoints=web"
       - "traefik.http.routers.frontend.priority=1"
       - "traefik.http.services.frontend.loadbalancer.server.port=3000"
-      - "com.centurylinklabs.watchtower.enable=true"
     depends_on:
       backend: { condition: service_healthy }
     <<: *logging-config
@@ -146,7 +140,7 @@ services:
   # MULTIMEDIA Y BASES DE DATOS
   # ========================================================
   minio:
-    image: minio/minio:RELEASE.2024-05-10T01-39-19Z
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
     container_name: cosmo_minio
     restart: always
     ports:
@@ -170,14 +164,14 @@ services:
       - "traefik.http.routers.minio-console.service=minio-console"
       - "traefik.http.services.minio-console.loadbalancer.server.port=9001"
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:9000/minio/health/live || exit 1"]
+      test: ["CMD", "mc", "ready", "local"]
       interval: 5s
       timeout: 3s
       retries: 5
     <<: *logging-config
 
   minio_setup:
-    image: minio/mc:RELEASE.2024-05-10T01-41-38Z
+    image: minio/mc:RELEASE.2025-08-13T08-35-41Z
     container_name: cosmo_minio_setup
     restart: "no"
     depends_on:
@@ -213,7 +207,7 @@ services:
     <<: *logging-config
 
   redis:
-    image: redis:7.2-alpine
+    image: redis:7.4-alpine
     container_name: cosmo_redis_local
     restart: always
     mem_limit: ${MEM_LIMIT_REDIS:-256m}
@@ -298,18 +292,6 @@ services:
     command: tunnel run
     <<: *logging-config
 
-  watchtower:
-    image: containrrr/watchtower:1.7.1
-    container_name: cosmo_watchtower
-    restart: always
-    mem_limit: 128m
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-    environment:
-      WATCHTOWER_NOTIFICATIONS: webhook
-      WATCHTOWER_NOTIFICATION_WEBHOOK_URL: ${WATCHTOWER_WEBHOOK_URL}
-    command: --interval 86400 --label-enable
-    <<: *logging-config
 
   portainer_agent:
     image: portainer/agent:2.39.4
