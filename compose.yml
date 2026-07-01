@@ -1,0 +1,401 @@
+# ========================================================
+# COSMO ERP - DOCKER COMPOSE CONFIGURATION (ON-PREMISE)
+# ========================================================
+
+x-backend-environment: &backend-environment
+  DEBUG: "False"
+  API_SECRET_KEY: ${API_SECRET_KEY}
+  DJANGO_SETTINGS_MODULE: ${DJANGO_SETTINGS_MODULE}
+  SECURE_SSL_REDIRECT: "False"
+  ENGINE_DB: django_tenants.postgresql_backend
+  NAME_DB: erp_local_db
+  USER_DB: cosmo_admin
+  PASSWORD_DB: ${PASSWORD_DB}
+  HOST_DB: db
+  PORT_DB: 5432
+  REDIS_URL: redis://:${REDIS_PASSWORD:-D3s4rr0ll0Redis}@redis:6379/0
+  CELERY_BROKER_URL: redis://:${REDIS_PASSWORD:-D3s4rr0ll0Redis}@redis:6379/0
+  CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD:-D3s4rr0ll0Redis}@redis:6379/0
+  OLLAMA_HOST: https://ia-laboratorio.com/ollama
+  NAME_CD: ${NAME_CD}
+  APY_KEY_CD: ${APY_KEY_CD}
+  APY_SECRET_CD: ${APY_SECRET_CD}
+  SENTRY_DSN: ${SENTRY_DSN}
+  SENTRY_TRACES_SAMPLE_RATE: ${SENTRY_TRACES_SAMPLE_RATE}
+  DOMAIN_NAME: ${DOMAIN_NAME}
+  USE_MINIO: "True"
+  AWS_ACCESS_KEY_ID: ${MINIO_USER}
+  AWS_SECRET_ACCESS_KEY: ${MINIO_PASSWORD}
+  AWS_STORAGE_BUCKET_NAME: "cosmo-media"
+  AWS_S3_ENDPOINT_URL: "http://minio:9000"
+  CLAMAV_URL: tcp://clamav:3310
+
+  # Observabilidad
+  PROM_URL: ${PROM_URL_HUB}
+  LOKI_URL: ${LOKI_URL_HUB}
+  LOKI_USER: ${LOKI_USER_HUB}
+  TEMPO_URL: ${TEMPO_URL_HUB}
+  TEMPO_USER: ${TEMPO_USER_HUB}
+  GRAFANA_API_KEY: ${GRAFANA_API_KEY}
+
+x-logging-config: &logging-config
+  logging:
+    driver: "json-file"
+    options:
+      max-size: "100m"
+      max-file: "3"
+
+services:
+  # ========================================================
+  # SEGURIDAD Y PREVENCIÓN DE AMENAZAS
+  # ========================================================
+  clamav:
+    image: clamav/clamav:latest
+    container_name: cosmo_clamav
+    restart: always
+    mem_limit: ${MEM_LIMIT_CLAMAV:-1536m}
+    <<: *logging-config
+
+  django_migration_runner:
+    image: ghcr.io/development-cosmo/cosmo-erp-backend:latest
+    container_name: cosmo_migration_runner
+    mem_limit: 512m
+    environment:
+      <<: *backend-environment
+    depends_on:
+      db: { condition: service_healthy }
+    command: python manage.py migrate_schemas --shared --tenant
+    restart: "no"
+    <<: *logging-config
+
+  # ========================================================
+  # LÓGICA DE NEGOCIO Y CONTENEDORES CORE
+  # ========================================================
+  backend:
+    image: ghcr.io/development-cosmo/cosmo-erp-backend:latest
+    container_name: cosmo_backend_local
+    restart: always
+    mem_limit: ${MEM_LIMIT_BACKEND:-512m}
+    environment:
+      <<: *backend-environment
+    depends_on:
+      db: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      minio: { condition: service_healthy }
+      django_migration_runner: { condition: service_completed_successfully }
+    command: daphne -b 0.0.0.0 -p 8000 --websocket_timeout 86400 ERP.asgi:application
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.backend.rule=PathPrefix(`/api/`) || PathPrefix(`/admin/`) || PathPrefix(`/ws/`) || PathPrefix(`/health/`) || Path(`/health`)"
+      - "traefik.http.routers.backend.entrypoints=web"
+      - "traefik.http.services.backend.loadbalancer.server.port=8000"
+      - "com.centurylinklabs.watchtower.enable=true"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:8000/health/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    <<: *logging-config
+
+  celery_worker:
+    image: ghcr.io/development-cosmo/cosmo-erp-backend:latest
+    container_name: cosmo_celery_worker
+    restart: always
+    mem_limit: ${MEM_LIMIT_WORKER:-768m}
+    environment:
+      <<: *backend-environment
+    depends_on:
+      django_migration_runner: { condition: service_completed_successfully }
+    command: celery -A ERP worker --loglevel=info --autoscale=${CELERY_MAX_WORKERS:-8},${CELERY_MIN_WORKERS:-2}
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+    <<: *logging-config
+
+  celery_beat:
+    image: ghcr.io/development-cosmo/cosmo-erp-backend:latest
+    container_name: cosmo_celery_beat
+    restart: always
+    mem_limit: 256m
+    environment:
+      <<: *backend-environment
+    depends_on:
+      django_migration_runner: { condition: service_completed_successfully }
+    command: celery -A ERP beat --loglevel=info --scheduler django_celery_beat.schedulers:DatabaseScheduler
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+    <<: *logging-config
+
+  frontend_local:
+    image: ghcr.io/development-cosmo/cosmo-erp-frontend:latest
+    container_name: cosmo_frontend_local
+    restart: always
+    mem_limit: ${MEM_LIMIT_FRONT:-512m}
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.frontend.rule=PathPrefix(`/`)"
+      - "traefik.http.routers.frontend.entrypoints=web"
+      - "traefik.http.routers.frontend.priority=1"
+      - "traefik.http.services.frontend.loadbalancer.server.port=3000"
+      - "com.centurylinklabs.watchtower.enable=true"
+    depends_on:
+      backend: { condition: service_healthy }
+    <<: *logging-config
+
+  # ========================================================
+  # MULTIMEDIA Y BASES DE DATOS
+  # ========================================================
+  minio:
+    image: minio/minio:latest
+    container_name: cosmo_minio
+    restart: always
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    mem_limit: ${MEM_LIMIT_MINIO:-512m}
+    environment:
+      MINIO_ROOT_USER: ${MINIO_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_PASSWORD}
+    volumes:
+      - minio_data:/data
+    command: server /data --console-address ":9001"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.minio-api.rule=PathPrefix(`/cosmo-media`)"
+      - "traefik.http.routers.minio-api.entrypoints=web"
+      - "traefik.http.routers.minio-api.priority=100"
+      - "traefik.http.routers.minio-api.service=minio-api"
+      - "traefik.http.services.minio-api.loadbalancer.server.port=9000"
+      - "traefik.http.routers.minio-console.rule=Host(`minio-console.${DOMAIN_NAME}`)"
+      - "traefik.http.routers.minio-console.service=minio-console"
+      - "traefik.http.services.minio-console.loadbalancer.server.port=9001"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9000/minio/health/live || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    <<: *logging-config
+
+  minio_setup:
+    image: minio/mc:latest
+    container_name: cosmo_minio_setup
+    restart: "no"
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_USER: ${MINIO_USER}
+      MINIO_PASSWORD: ${MINIO_PASSWORD}
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local_s3 http://minio:9000 \"$${MINIO_USER}\" \"$${MINIO_PASSWORD}\";
+      mc mb local_s3/cosmo-media || true;
+      mc anonymous set public local_s3/cosmo-media;
+      mc version enable local_s3/cosmo-media;
+      exit 0;
+      "
+    <<: *logging-config
+
+  db:
+    image: pgvector/pgvector:pg15
+    container_name: cosmo_postgres_local
+    restart: always
+    mem_limit: ${MEM_LIMIT_DB:-1g}
+    environment:
+      POSTGRES_DB: erp_local_db
+      POSTGRES_USER: cosmo_admin
+      POSTGRES_PASSWORD: ${PASSWORD_DB}
+    volumes:
+      - postgres_local_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cosmo_admin -d erp_local_db"]
+      interval: 5s
+    <<: *logging-config
+
+  redis:
+    image: redis:7-alpine
+    container_name: cosmo_redis_local
+    restart: always
+    mem_limit: ${MEM_LIMIT_REDIS:-256m}
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-D3s4rr0ll0Redis} --maxmemory 128mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_local_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-D3s4rr0ll0Redis}", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    <<: *logging-config
+
+  # ========================================================
+  # SISTEMA DE RESPALDO (LOCAL Y REMOTO A CLOUDFLARE R2)
+  # ========================================================
+  postgres_backup_local:
+    image: prodrigestivill/postgres-backup-local:15
+    container_name: cosmo_postgres_backup_local
+    restart: always
+    mem_limit: 256m
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_DB: erp_local_db
+      POSTGRES_USER: cosmo_admin
+      POSTGRES_PASSWORD: ${PASSWORD_DB}
+      SCHEDULE: "0 13,18 * * *"
+      BACKUP_KEEP_DAYS: 7
+    volumes:
+      - /opt/cosmo/backups:/backups
+    depends_on:
+      db: { condition: service_healthy }
+    <<: *logging-config
+
+  postgres_backup_s3:
+    image: ghcr.io/solectrus/postgres-s3-backup:15
+    container_name: cosmo_postgres_backup_s3
+    restart: always
+    mem_limit: 256m
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_DATABASE: erp_local_db
+      POSTGRES_USER: cosmo_admin
+      POSTGRES_PASSWORD: ${PASSWORD_DB}
+      SCHEDULE: "0 13,18 * * *"
+      BACKUP_KEEP_DAYS: 7
+      S3_ENDPOINT: ${BACKUP_S3_ENDPOINT}
+      S3_REGION: ${BACKUP_S3_REGION:-auto}
+      S3_ACCESS_KEY_ID: ${BACKUP_S3_ACCESS_KEY_ID}
+      S3_SECRET_ACCESS_KEY: ${BACKUP_S3_SECRET_ACCESS_KEY}
+      S3_BUCKET: ${BACKUP_S3_BUCKET}
+      S3_PREFIX: backups/
+    depends_on:
+      db: { condition: service_healthy }
+    <<: *logging-config
+
+  # ========================================================
+  # GESTIÓN Y MONITOREO (HUB & SPOKE)
+  # ========================================================
+  traefik:
+    image: traefik:v2.11
+    container_name: cosmo_traefik
+    restart: always
+    mem_limit: 128m
+    ports:
+      - "8080:80"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    command:
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+    <<: *logging-config
+
+  cloudflare_tunnel:
+    image: cloudflare/cloudflared:latest
+    container_name: cosmo_tunnel
+    restart: always
+    mem_limit: 128m
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN}
+    command: tunnel run
+    <<: *logging-config
+
+  watchtower:
+    image: containrrr/watchtower:1.7.1
+    container_name: cosmo_watchtower
+    restart: always
+    mem_limit: 128m
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      WATCHTOWER_NOTIFICATIONS: webhook
+      WATCHTOWER_NOTIFICATION_WEBHOOK_URL: ${WATCHTOWER_WEBHOOK_URL}
+    command: --interval 86400 --label-enable
+    <<: *logging-config
+
+  portainer_agent:
+    image: portainer/agent:2.39.4
+    container_name: cosmo_portainer_agent
+    restart: always
+    mem_limit: 128m
+    environment:
+      EDGE: 1
+      EDGE_KEY: ${PORTAINER_EDGE_KEY}
+      EDGE_ID: ${PORTAINER_EDGE_ID}
+      EDGE_INSECURE_POLL: 1
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /var/lib/docker/volumes:/var/lib/docker/volumes
+      - /:/host
+      - portainer_agent_data:/data
+    <<: *logging-config
+
+  portainer_local:
+    image: portainer/portainer-ce:latest
+    container_name: cosmo_portainer_local
+    restart: always
+    mem_limit: 128m
+    command: --no-setup-token
+    ports:
+      - "9005:9000"
+      - "9443:9443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - portainer_local_data:/data
+    <<: *logging-config
+
+  netdata:
+    image: netdata/netdata:stable
+    container_name: cosmo_netdata
+    restart: always
+    mem_limit: 128m
+    hostname: ${DOMAIN_NAME:-cosmo-server}
+    ports:
+      - "19999:19999"
+    security_opt:
+      - apparmor:unconfined
+    cap_add:
+      - SYS_PTRACE
+      - SYS_ADMIN
+    volumes:
+      - netdatacache:/var/cache/netdata
+      - netdatalib:/var/lib/netdata
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /etc/os-release:/host/etc/os-release:ro
+    <<: *logging-config
+
+  # ========================================================
+  # OBSERVABILIDAD MODERNA (GRAFANA ALLOY)
+  # ========================================================
+  alloy:
+    image: grafana/alloy:latest
+    container_name: cosmo_alloy
+    restart: always
+    mem_limit: 256m
+    user: "0:0"
+    ports:
+      - "4317:4317"
+      - "4318:4318"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./alloy-config.alloy:/etc/alloy/config.alloy
+      - alloy_data:/var/lib/alloy/data
+    command: run --storage.path=/var/lib/alloy/data /etc/alloy/config.alloy
+    environment:
+      PROM_URL: ${PROM_URL_HUB}
+      PROM_USER: ${PROM_USER}
+      LOKI_URL: ${LOKI_URL_HUB}
+      LOKI_USER: ${LOKI_USER}
+      TEMPO_URL: ${TEMPO_URL}
+      TEMPO_USER: ${TEMPO_USER}
+      GRAFANA_API_KEY: ${GRAFANA_API_KEY}
+    <<: *logging-config
+
+volumes:
+  postgres_local_data:
+  redis_local_data:
+  minio_data:
+  alloy_data:
+  portainer_local_data:
+  portainer_agent_data:
+  netdatacache:
+  netdatalib:
